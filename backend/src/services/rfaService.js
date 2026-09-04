@@ -11,7 +11,7 @@
  *
  * Decision routing (_resolveDecision):
  *   - Surgical CPT codes (10000–69999 or Category III /^\d{4}T$/) → route_to_uro
- *   - AI recommends auto_approve                                  → auto_approve
+ *   - AI recommends approval, MTUS-consistent                    → adjuster_review
  *   - AI MTUS-inconsistent                                        → route_to_uro
  *   - Otherwise (AI says physician_review, MTUS-consistent)       → adjuster_review
  *
@@ -90,22 +90,19 @@ function _isFirst30Days(dateOfInjury) {
 /**
  * Map AI output + claim context → internal routing decision.
  *
- * Returns one of: 'auto_approve' | 'adjuster_review' | 'route_to_uro'
+ * Returns one of: 'adjuster_review' | 'route_to_uro'
  */
 function _resolveDecision(aiResult, rfa, claim) {
   // 1. Surgical CPT override — always goes to URO regardless of AI
   if (_isSurgical(rfa.cpt_codes || [])) {
     return 'route_to_uro';
   }
-  // 2. AI recommends auto-approval
-  if (aiResult.recommendedAction === 'auto_approve') {
-    return 'auto_approve';
-  }
-  // 3. MTUS-inconsistent → URO (not adjuster — only a physician can deny)
-  if (!aiResult.mtusConsistency) {
+  // Approval is a human disposition. Missing or inconsistent evidence
+  // must not be promoted to approval by a model recommendation.
+  if (aiResult.mtusConsistency !== true) {
     return 'route_to_uro';
   }
-  // 4. MTUS-consistent but AI did not auto-approve → adjuster queue
+  // MTUS-consistent recommendations always go to the adjuster queue.
   return 'adjuster_review';
 }
 
@@ -138,6 +135,7 @@ function _claimSnapshot(claim) {
 async function _seedRFADiary(claimId, rfaId, deadline) {
   const row = {
     claim_id:           claimId,
+    rfa_id:             rfaId,
     diary_type:         'RFA_RESPONSE_DUE',
     due_date:           deadline.split('T')[0],
     assigned_to:        config.adjuster.email,
@@ -159,6 +157,7 @@ async function _completeRFADiary(claimId, rfaId) {
     .from('diaries')
     .select('id')
     .eq('claim_id', claimId)
+    .eq('rfa_id', rfaId)
     .eq('diary_type', 'RFA_RESPONSE_DUE')
     .eq('status', 'open');
 
@@ -173,26 +172,6 @@ async function _completeRFADiary(claimId, rfaId) {
 }
 
 // ── Outcome writers ───────────────────────────────────────────────────────────
-
-async function _autoApproveRFA(rfaId, claimId, deadline) {
-  const now = new Date().toISOString();
-  await supabase.from('rfas').update({
-    decision:         'auto_approved',
-    decision_made_at: now,
-    decision_made_by: 'ai_system',
-    updated_at:       now,
-  }).eq('id', rfaId);
-
-  await supabase.from('claim_events').insert({
-    claim_id:  claimId,
-    type:      'rfa_approved',
-    timestamp: now,
-    data:      { rfaId, decision: 'auto_approved', decidedBy: 'ai_system', deadline },
-  });
-
-  await _completeRFADiary(claimId, rfaId);
-  logger.info({ msg: 'rfaService: auto-approved', rfaId, claimId });
-}
 
 async function _queueForAdjusterReview(rfaId, claimId, aiResult) {
   const now = new Date().toISOString();
@@ -224,8 +203,10 @@ async function _routeToEnlyte(rfaId, claimId, rfa, claim, aiResult, reason) {
   try {
     const result = await enlyte.submitReferral(rfa, claim, reason || 'Routed by RFA decision engine');
     referralId = result.referralId;
+    if (!referralId) throw new Error('URO did not confirm a referral ID');
   } catch (err) {
     logger.error({ msg: 'rfaService._routeToEnlyte: submitReferral failed', err: err.message, rfaId });
+    throw new Error('URO referral failed; RFA remains unresolved and its response diary stays open');
   }
 
   await supabase.from('rfas').update({
@@ -329,7 +310,8 @@ async function createRFA(claimId, rfaData, receivedVia) {
   logger.info({ msg: 'rfaService.createRFA: created', rfaId, claimId, urgency, deadline });
 
   // Trigger async AI evaluation — runs after HTTP response is sent
-  setImmediate(() => evaluateRFA(rfaId));
+  setImmediate(() => evaluateRFA(rfaId).catch(err =>
+    logger.error({ msg: 'RFA evaluation requires retry', rfaId, err: err.message })));
 
   return inserted;
 }
@@ -397,10 +379,7 @@ async function evaluateRFA(rfaId) {
   // Route based on decision
   const decision = _resolveDecision(aiResult, rfa, claim);
 
-  if (decision === 'auto_approve') {
-    await _autoApproveRFA(rfaId, rfa.claim_id, rfa.response_due_at);
-    _fireNotice(_getNoticeService().generateRfaLetter, rfaId);
-  } else if (decision === 'adjuster_review') {
+  if (decision === 'adjuster_review') {
     await _queueForAdjusterReview(rfaId, rfa.claim_id, aiResult);
     // No notice yet — pending human decision
   } else if (decision === 'route_to_uro') {
@@ -408,9 +387,8 @@ async function evaluateRFA(rfaId) {
       ? 'Surgical procedure — URO required per CCR §9792.6.1'
       : 'MTUS-inconsistent treatment — physician review required';
     await _routeToEnlyte(rfaId, rfa.claim_id, rfa, claim, aiResult, reason);
-    // URO denial: RFA determination letter + IMR rights notice
-    _fireNotice(_getNoticeService().generateRfaLetter, rfaId);
-    _fireNotice(_getNoticeService().generateImrRightsNotice, rfaId);
+    // Referral is not a determination. Notices belong to a verified
+    // physician determination return path, not submission.
   }
 }
 
@@ -469,8 +447,7 @@ async function adjusterRouteToURO(rfaId, adjusterEmail, reason) {
     updated_at: now,
   }).eq('id', rfaId);
 
-  _fireNotice(_getNoticeService().generateRfaLetter, rfaId);
-  _fireNotice(_getNoticeService().generateImrRightsNotice, rfaId);
+  // Referral alone does not trigger determination or IMR notices.
   try {
     await require('./aiDecisionsService').linkHumanDecision(rfa.claim_id, 'rfa_mtus', {
       human_reviewer_id: null, human_decision: `routed_to_uro by ${adjusterEmail}`,

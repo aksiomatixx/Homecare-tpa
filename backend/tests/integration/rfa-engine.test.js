@@ -206,9 +206,9 @@ describe('rfaService._resolveDecision', () => {
     expect(rfaService._resolveDecision(AI_AUTO_APPROVE, rfa, claim)).toBe('route_to_uro');
   });
 
-  test('AI auto_approve + MTUS consistent → auto_approve', () => {
+  test('AI auto_approve + MTUS consistent → human review', () => {
     const rfa = { cpt_codes: ['97110'] };
-    expect(rfaService._resolveDecision(AI_AUTO_APPROVE, rfa, claim)).toBe('auto_approve');
+    expect(rfaService._resolveDecision(AI_AUTO_APPROVE, rfa, claim)).toBe('adjuster_review');
   });
 
   test('AI physician_review + MTUS consistent → adjuster_review', () => {
@@ -517,7 +517,7 @@ describe('POST /api/v1/rfas/:id/route-to-uro', () => {
 // =============================================================================
 
 describe('rfaService.evaluateRFA — auto_approve path', () => {
-  test('sets decision to auto_approved when AI recommends it and codes are not surgical', async () => {
+  test('requires human approval when AI recommends it and codes are not surgical', async () => {
     aiService.evaluateRFA.mockResolvedValueOnce(AI_AUTO_APPROVE);
 
     const rfa = await seedRFAInStore({
@@ -530,7 +530,7 @@ describe('rfaService.evaluateRFA — auto_approve path', () => {
     const { data: updated } = await supabase
       .from('rfas').select('*').eq('id', 'rfa_eval_auto').single();
 
-    expect(updated.decision).toBe('auto_approved');
+    expect(updated.decision).toBe('pending_adjuster_review');
     expect(updated.decision_made_by).toBe('ai_system');
   });
 
@@ -545,10 +545,10 @@ describe('rfaService.evaluateRFA — auto_approve path', () => {
 
     expect(evals.length).toBe(1);
     expect(evals[0].mtus_consistent).toBe(true);
-    expect(evals[0].recommendation).toBe('auto_approve');
+    expect(evals[0].recommendation).toBe('adjuster_review');
   });
 
-  test('completes the RFA_RESPONSE_DUE diary on auto-approve', async () => {
+  test('keeps the RFA_RESPONSE_DUE diary open until human approval', async () => {
     aiService.evaluateRFA.mockResolvedValueOnce(AI_AUTO_APPROVE);
     await seedRFAInStore({ id: 'rfa_eval_diary', cpt_codes: ['97110'] });
 
@@ -566,7 +566,7 @@ describe('rfaService.evaluateRFA — auto_approve path', () => {
     const { data: diary } = await supabase
       .from('diaries').select('*').eq('id', 'diary_rfa_001').single();
 
-    expect(diary.status).toBe('completed');
+    expect(diary.status).toBe('open');
   });
 });
 
@@ -651,5 +651,35 @@ describe('rfaService.evaluateRFA — error paths', () => {
 
   test('handles non-existent RFA gracefully', async () => {
     await expect(rfaService.evaluateRFA('rfa_nonexistent')).resolves.toBeUndefined();
+  });
+});
+
+describe('pilot readiness regressions', () => {
+  test('approval closes only the matching RFA diary', async () => {
+    await seedRFAInStore({ id: 'rfa_scope_a' });
+    await seedRFAInStore({ id: 'rfa_scope_b' });
+    await supabase.from('diaries').insert([
+      { id: 'scope_a', claim_id: CLAIM_ID, rfa_id: 'rfa_scope_a', diary_type: 'RFA_RESPONSE_DUE', status: 'open' },
+      { id: 'scope_b', claim_id: CLAIM_ID, rfa_id: 'rfa_scope_b', diary_type: 'RFA_RESPONSE_DUE', status: 'open' },
+      { id: 'scope_legacy', claim_id: CLAIM_ID, diary_type: 'RFA_RESPONSE_DUE', status: 'open' },
+    ]);
+    await rfaService.adjusterApproveRFA('rfa_scope_a', 'reviewer@example.test');
+    const { data } = await supabase.from('diaries').select('*');
+    expect(data.find(d => d.id === 'scope_a').status).toBe('completed');
+    expect(data.find(d => d.id === 'scope_b').status).toBe('open');
+    expect(data.find(d => d.id === 'scope_legacy').status).toBe('open');
+  });
+
+  test('vendor outage does not produce a sent referral', async () => {
+    await seedRFAInStore({ id: 'rfa_outage' });
+    require('../../src/services/enlyteService').submitReferral.mockRejectedValueOnce(new Error('offline'));
+    await expect(rfaService.adjusterRouteToURO('rfa_outage', 'reviewer@example.test')).rejects.toThrow('URO referral failed');
+    const rfa = await rfaService.getRFA('rfa_outage');
+    expect(rfa.decision).toBeNull();
+    expect(rfa.enlyte_sent_at).toBeUndefined();
+  });
+
+  test('contradictory model approval routes to physician review', () => {
+    expect(rfaService._resolveDecision({ recommendedAction: 'auto_approve', mtusConsistency: false }, { cpt_codes: ['97110'] }, {})).toBe('route_to_uro');
   });
 });

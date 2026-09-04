@@ -123,8 +123,8 @@ function getWeeksForPv(pv) {
 function computeLateInterest(amount, docDate, actualPayDate) {
   const a = parseFloat(amount) || 0;
   if (a <= 0) return 0;
-  const d1 = new Date(docDate + (docDate.includes('T') ? '' : 'T00:00:00'));
-  const d2 = new Date(actualPayDate + (actualPayDate.includes('T') ? '' : 'T00:00:00'));
+  const d1 = new Date(docDate + (docDate.includes('T') ? '' : 'T00:00:00Z'));
+  const d2 = new Date(actualPayDate + (actualPayDate.includes('T') ? '' : 'T00:00:00Z'));
   const days = Math.floor((d2.getTime() - d1.getTime()) / (1000 * 60 * 60 * 24));
   if (days <= 0) return 0;
   return Math.round(a * days * DEU_POLICY.LATE_PAYMENT_RATE_ANNUAL / 365 * 100) / 100;
