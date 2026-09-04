@@ -14,6 +14,12 @@ A regulatory-aware execution layer that runs AI agents on top of existing claims
 
 </div>
 
+## Production readiness
+
+HIPAA readiness and an independent SOC 2 examination are production launch requirements, not current certifications. The public demo remains synthetic. See [pilot readiness](docs/pilot-readiness.md) for deployment prerequisites and unresolved controls.
+
+RFA approval recommendations now require human disposition. Referral submission does not generate determination or IMR notices. Apply `20260904000001_rfa_diary_scope.sql` before deploying this backend; unmatched historical RFA diaries stay open for manual reconciliation.
+
 ## What this is
 
 ClaimLayer is a reference implementation of how to deploy AI agents into a highly regulated workflow — California workers' compensation claims — with the model boxed in by code rather than trusted. Five Claude agents draft compensability analyses, evaluate treatment authorizations, price settlements, and extract intake; a deterministic gate screens for Medicare interests. Each agent runs inside guardrails enforced in code, with a licensed human at every consequential decision and a queryable audit trail behind every model call. It runs on synthetic demo data — a worked example, not a live system (see [Status & scope](#status--scope)).
